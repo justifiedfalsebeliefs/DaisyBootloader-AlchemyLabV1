@@ -1,5 +1,6 @@
 #include "bootloader.h"
 #include "daisy_seed.h"
+#include "alchemy_leds.h"
 
 using namespace daisy;
 
@@ -40,6 +41,8 @@ int main(void) {
 
 	boot.Init(hw.qspi, Pin(daisy::PORTC, 7), Pin(), timeout_ms, DaisyDeInitCallback, (void*)&hw);
 
+	alchemy::LedInit();
+
 	hw.StartAudio(AudioCallback);
 
 	boot.IoInit();
@@ -47,5 +50,6 @@ int main(void) {
 	while(1)
 	{
 		boot.LoopProcess();
+		alchemy::LedUpdate(System::GetNow());
 	}
 }

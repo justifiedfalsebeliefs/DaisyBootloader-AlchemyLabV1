@@ -92,8 +92,7 @@ void LedInit() {
 
     // ── Clocks ───────────────────────────────────────────────────────────────
     __HAL_RCC_TIM3_CLK_ENABLE();
-    __HAL_RCC_DMA1_CLK_ENABLE();
-    __HAL_RCC_DMAMUX1_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();  // also enables DMAMUX1 on H7
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
     // ── PC9 → TIM3_CH4 (AF2) ─────────────────────────────────────────────────

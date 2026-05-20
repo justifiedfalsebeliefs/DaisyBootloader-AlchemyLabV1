@@ -67,7 +67,7 @@
 #define DSY_USB_DESC_MFR_STR "Electrosmith"
 #endif
 #ifndef DSY_USB_DESC_PRODUCT_STR
-#define DSY_USB_DESC_PRODUCT_STR "Daisy Bootloader"
+#define DSY_USB_DESC_PRODUCT_STR "Alchemy Lab"
 #endif
 
 #define USBD_VID     1155

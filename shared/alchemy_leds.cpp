@@ -1,51 +1,40 @@
+#pragma GCC optimize("Os")
 #include "alchemy_leds.h"
 #include "stm32h7xx_hal.h"
 #include <cstring>
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Hardware constants
+// Constants
 // ──────────────────────────────────────────────────────────────────────────────
 
-// TIM3 PWM at 240 MHz TIM clock → 800 kHz WS2812
-static constexpr uint32_t kPeriod = 300;   // ARR = kPeriod-1 = 299
-static constexpr uint32_t kBit0   = 96;    // T0H ≈ 400 ns  (32 % duty)
-static constexpr uint32_t kBit1   = 192;   // T1H ≈ 800 ns  (64 % duty)
+// TIM3 at 240 MHz (SYSCLK=480→HCLK÷2=240→APB1÷2=120→TIM3=2×120=240 MHz)
+// 800 kHz WS2812: period=300 ticks
+static constexpr uint32_t kPeriod = 300;
+static constexpr uint32_t kBit0   = 96;   // 32 % → T0H ≈ 400 ns
+static constexpr uint32_t kBit1   = 192;  // 64 % → T1H ≈ 800 ns
 
-static constexpr uint16_t kNumLeds    = 102;
-static constexpr uint16_t kResetLen   = 50;   // ≥50 × 1.25 µs = 62.5 µs latch
-static constexpr uint16_t kDmaBufLen  = kNumLeds * 24u + kResetLen;  // 2498
+static constexpr uint16_t kNumLeds   = 102;
+static constexpr uint16_t kResetLen  = 50;
+static constexpr uint16_t kDmaBufLen = kNumLeds * 24u + kResetLen;  // 2498
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Animation constants
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Chain-start index for each of the 6 pot rings (from kAlchemyLabV1Layout).
+// Ring chain-start indices from kAlchemyLabV1Layout
 static constexpr uint8_t kRingStart[6] = {69, 86, 52, 35, 17, 0};
 static constexpr uint8_t kLedsPerRing  = 16;
 static constexpr uint8_t kNumRings     = 6;
+static constexpr uint32_t kRevMs       = 2000;
 
-// Spinning animation: one full revolution per kRevMs milliseconds.
-static constexpr uint32_t kRevMs = 2000;
-
-// Colour at very low brightness: warm-white at ~5 % of full scale.
-// WS2812 byte order is G, R, B.
-static constexpr uint8_t kColG = 5;
-static constexpr uint8_t kColR = 10;
-static constexpr uint8_t kColB = 2;
+// Warm-white at ~5 % brightness, WS2812 GRB order
+static constexpr uint8_t kColG = 5, kColR = 10, kColB = 2;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Module-level state
+// State (file-scope to avoid class overhead)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GRB frame buffer (regular SRAM — small, 306 bytes).
-static uint8_t s_frame[kNumLeds * 3];
+static uint8_t  s_frame[kNumLeds * 3];
 
-// DMA PWM buffer placed in D2 RAM (DMA-accessible, not cached).
-// __attribute__ section maps to RAM_D2_DMA (0x30000000, 32 KB) in the
-// boot_linker.lds .sram1_bss region.
+// DMA buffer in D2 RAM so DMA1 can reach it without going through AXI.
 static uint32_t s_dma_buf[kDmaBufLen] __attribute__((section(".sram1_bss")));
 
-static TIM_HandleTypeDef s_htim;
 static DMA_HandleTypeDef s_hdma;
 static volatile bool     s_busy;
 
@@ -53,28 +42,18 @@ static volatile bool     s_busy;
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+static void OnDmaComplete(DMA_HandleTypeDef*) { s_busy = false; }
+
 static void BuildDmaBuf() {
     uint16_t idx = 0;
     for (uint16_t led = 0; led < kNumLeds; ++led) {
-        for (int byte_i = 0; byte_i < 3; ++byte_i) {
-            uint8_t val = s_frame[led * 3 + byte_i];
-            for (int bit = 7; bit >= 0; --bit) {
+        for (int b = 0; b < 3; ++b) {
+            uint8_t val = s_frame[led * 3 + b];
+            for (int bit = 7; bit >= 0; --bit)
                 s_dma_buf[idx++] = (val >> bit) & 1u ? kBit1 : kBit0;
-            }
         }
     }
-    while (idx < kDmaBufLen) s_dma_buf[idx++] = 0u;  // reset guard
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// HAL callback — fires when DMA transfer completes (TIM3_CH4 DMA done)
-// ──────────────────────────────────────────────────────────────────────────────
-
-extern "C" void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef* htim) {
-    if (htim->Instance == TIM3) {
-        HAL_TIM_PWM_Stop_DMA(&s_htim, TIM_CHANNEL_4);
-        s_busy = false;
-    }
+    while (idx < kDmaBufLen) s_dma_buf[idx++] = 0u;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -86,16 +65,16 @@ namespace alchemy {
 DMA_HandleTypeDef& LedGetHdma() { return s_hdma; }
 
 void LedInit() {
-    memset(s_frame,   0, sizeof(s_frame));
-    memset(s_dma_buf, 0, sizeof(s_dma_buf));
+    memset(s_frame, 0, sizeof(s_frame));
     s_busy = false;
 
-    // ── Clocks ───────────────────────────────────────────────────────────────
+    // ── Clocks ────────────────────────────────────────────────────────────────
     __HAL_RCC_TIM3_CLK_ENABLE();
-    __HAL_RCC_DMA1_CLK_ENABLE();  // also enables DMAMUX1 on H7
+    __HAL_RCC_DMA1_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    // ── PC9 → TIM3_CH4 (AF2) ─────────────────────────────────────────────────
+    // ── PC9 → TIM3_CH4 AF2 ───────────────────────────────────────────────────
+    // HAL_GPIO_Init is already in the binary via libDaisy GPIO usage.
     GPIO_InitTypeDef gpio{};
     gpio.Pin       = GPIO_PIN_9;
     gpio.Mode      = GPIO_MODE_AF_PP;
@@ -104,25 +83,22 @@ void LedInit() {
     gpio.Alternate = GPIO_AF2_TIM3;
     HAL_GPIO_Init(GPIOC, &gpio);
 
-    // ── TIM3 PWM base ─────────────────────────────────────────────────────────
-    s_htim.Instance               = TIM3;
-    s_htim.Init.Prescaler         = 0;
-    s_htim.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    s_htim.Init.Period            = kPeriod - 1u;  // 299
-    s_htim.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    s_htim.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    HAL_TIM_PWM_Init(&s_htim);
+    // ── TIM3 via direct registers — avoids pulling in the HAL TIM module ─────
+    // CH4 = PWM Mode 1 (high while CNT < CCR4); Update event drives DMA.
+    TIM3->CR1   = 0;
+    TIM3->PSC   = 0;
+    TIM3->ARR   = kPeriod - 1u;            // 299 → 800 kHz
+    TIM3->CCR4  = 0;
+    TIM3->CCMR2 = 6u << TIM_CCMR2_OC4M_Pos; // PWM Mode 1, CC4S=output
+    TIM3->CCER  = TIM_CCER_CC4E;             // CH4 output enable, active-high
+    TIM3->DIER  = TIM_DIER_UDE;              // DMA request on Update event
+    TIM3->EGR   = TIM_EGR_UG;               // Apply PSC/ARR immediately
+    TIM3->CR1   = TIM_CR1_CEN;              // Run counter
 
-    TIM_OC_InitTypeDef oc{};
-    oc.OCMode     = TIM_OCMODE_PWM1;
-    oc.Pulse      = 0;
-    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
-    oc.OCFastMode = TIM_OCFAST_DISABLE;
-    HAL_TIM_PWM_ConfigChannel(&s_htim, &oc, TIM_CHANNEL_4);
-
-    // ── DMA1_Stream7 → DMAMUX TIM3_CH4 (request 26) ──────────────────────────
+    // ── DMA1_Stream7 → DMAMUX TIM3_UP (request 27) ───────────────────────────
+    // HAL_DMA_Init and HAL_DMA_Start_IT are already in the binary via SAI DMA.
     s_hdma.Instance                 = DMA1_Stream7;
-    s_hdma.Init.Request             = DMA_REQUEST_TIM3_CH4;
+    s_hdma.Init.Request             = DMA_REQUEST_TIM3_UP;
     s_hdma.Init.Direction           = DMA_MEMORY_TO_PERIPH;
     s_hdma.Init.PeriphInc           = DMA_PINC_DISABLE;
     s_hdma.Init.MemInc              = DMA_MINC_ENABLE;
@@ -133,26 +109,22 @@ void LedInit() {
     s_hdma.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
     HAL_DMA_Init(&s_hdma);
 
-    // Link DMA handle to TIM handle (channel 4 slot)
-    __HAL_LINKDMA(&s_htim, hdma[TIM_DMA_ID_CC4], s_hdma);
+    s_hdma.XferCpltCallback  = OnDmaComplete;
+    s_hdma.XferErrorCallback = nullptr;
 
-    // DMA1_Stream7 is not used by libDaisy — safe to claim here.
     HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
 }
 
 void LedUpdate(uint32_t t_ms) {
-    if (s_busy) return;  // previous frame still in flight
+    if (s_busy) return;
 
-    // Clear frame
     memset(s_frame, 0, sizeof(s_frame));
 
-    // Spinning single pip per ring, all rings phase-staggered.
     for (uint8_t ring = 0; ring < kNumRings; ++ring) {
         uint32_t phase_ms = (t_ms + ring * (kRevMs / kNumRings)) % kRevMs;
         uint8_t  led_off  = static_cast<uint8_t>((phase_ms * kLedsPerRing) / kRevMs);
         uint16_t chain    = kRingStart[ring] + led_off;
-
         s_frame[chain * 3 + 0] = kColG;
         s_frame[chain * 3 + 1] = kColR;
         s_frame[chain * 3 + 2] = kColB;
@@ -160,14 +132,16 @@ void LedUpdate(uint32_t t_ms) {
 
     BuildDmaBuf();
     s_busy = true;
-    HAL_TIM_PWM_Start_DMA(&s_htim, TIM_CHANNEL_4, s_dma_buf, kDmaBufLen);
+    // Write each DMA value to TIM3->CCR4; the Update event (800 kHz) clocks it.
+    HAL_DMA_Start_IT(&s_hdma,
+                     reinterpret_cast<uint32_t>(s_dma_buf),
+                     reinterpret_cast<uint32_t>(&TIM3->CCR4),
+                     kDmaBufLen);
 }
 
 } // namespace alchemy
 
-// ──────────────────────────────────────────────────────────────────────────────
-// DMA1_Stream7 IRQ — not defined elsewhere in libDaisy
-// ──────────────────────────────────────────────────────────────────────────────
+// DMA1_Stream7 is unused by libDaisy — safe to define here.
 extern "C" void DMA1_Stream7_IRQHandler(void) {
     HAL_DMA_IRQHandler(&alchemy::LedGetHdma());
 }
